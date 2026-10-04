@@ -35,7 +35,8 @@ SIGN_KEY = "9BSGc4rO5uSkAEDO1UaHur6fui5B5jJ4"
 
 DEFAULT_CONFIG = {
     "proxy": "",                 # 留空=自动读系统代理；也可填 "127.0.0.1:7897" 或 "none" 强制直连
-    "split_at_punctuation": True,
+    "split_at_punctuation": True,   # 优先在标点处断句（强烈建议开启，关闭则纯按字符数切）
+    "punct_lookahead": None,        # 为凑标点允许多看几个字；None=自动(1/4，最多8)，0=严格不超
     "request_interval": 1.0,
     "poll_interval": 2.0,
     "poll_timeout": 180,
@@ -349,28 +350,71 @@ def list_references(session=None, auth=None, log=print):
 
 # ---------- 文本分割 ----------
 
-_PUNCT = "。！？；!?;\n"
+# 句末标点：优先在这里断（分句最自然）
+_SENT_END = "。！？!?；;…"
+# 段末换行：最强断点
+_PARA_END = "\n\r"
+# 句内停顿：找不到句末标点时退而求其次（不要在词中间硬切）
+_SENT_PAUSE = "，、：:,.'\"）)】]》」』"
+_PUNCT = _SENT_END + _PARA_END + _SENT_PAUSE
+# 标点优先级加分：越"像句末"越优先
+_PUNCT_BONUS = {ch: 3 for ch in _SENT_END}
+_PUNCT_BONUS.update({ch: 5 for ch in _PARA_END})
 
 
-def split_text(text, chunk_size=20, prefer_punct=True):
+def _pick_cut(text, start, chunk_size, min_len, lookahead):
+    """在 start 附近找一个最合适的切点（返回绝对索引，标点归前一段）。
+
+    只在 [start+min_len, start+chunk_size+lookahead] 里挑，避免切出过短碎片；
+    优先段落/句末标点，同类里取离目标长度最近的；没有标点则返回 None。
+    """
+    target = start + chunk_size
+    lo = start + min_len
+    hi = min(start + chunk_size + lookahead, len(text))
+    best, best_score = None, None
+    for k in range(lo, hi):
+        ch = text[k]
+        if ch not in _PUNCT:
+            continue
+        cut = k + 1                                   # 标点留给前一段，读起来才收得住
+        score = abs(cut - target) - _PUNCT_BONUS.get(ch, 0)
+        if best_score is None or score < best_score:
+            best, best_score = cut, score
+    return best
+
+
+def split_text(text, chunk_size=20, prefer_punct=True, lookahead=None):
+    """按字符数分段，但优先在标点处裁开，避免把句子/词切断。
+
+    - 每段尽量不超过 chunk_size；为了凑到标点允许向后多看 lookahead 个字
+    - 优先段落换行，其次句末标点（。！？；），再次句内停顿（，、：）
+    - 标点跟着前一段，下一段从标点之后开始
+    - 窗口中确实没有标点时，才退回按字符数硬切
+    """
     text = text.strip()
     if not text:
         return []
+    chunk_size = max(1, int(chunk_size))
+    n = len(text)
+
+    if not prefer_punct:
+        return [text[i:i + chunk_size].strip()
+                for i in range(0, n, chunk_size) if text[i:i + chunk_size].strip()]
+
+    min_len = max(1, chunk_size // 2)                 # 最短一段，防止碎片化
+    if lookahead is None:
+        lookahead = max(1, min(chunk_size // 4, 8))   # 默认允许略微超出以凑标点
+    lookahead = max(0, int(lookahead))
+
     chunks = []
-    i, n = 0, len(text)
+    i = 0
     while i < n:
-        if n - i <= chunk_size:
+        if n - i <= chunk_size:                       # 剩下的不超一段，直接收尾
             chunks.append(text[i:])
             break
-        piece = text[i:i + chunk_size]
-        cut = chunk_size
-        if prefer_punct:
-            for j in range(chunk_size - 1, max(chunk_size // 3, 1) - 1, -1):
-                if piece[j - 1] in _PUNCT:
-                    cut = j
-                    break
-        chunks.append(text[i:i + cut])
-        i += cut
+        cut = _pick_cut(text, i, chunk_size, min_len, lookahead) or (i + chunk_size)
+        chunks.append(text[i:cut])
+        i = cut
     return [c.strip() for c in chunks if c.strip()]
 
 
@@ -456,7 +500,8 @@ def synthesize(text, chunk_size, reference_id, out_path, log=print, should_stop=
         reference_id = refs[0]["referenceId"]
         log("使用音色：%s（%s）" % (refs[0].get("referenceName"), reference_id))
 
-    chunks = split_text(text, chunk_size, cfg.get("split_at_punctuation", True))
+    chunks = split_text(text, chunk_size, cfg.get("split_at_punctuation", True),
+                        cfg.get("punct_lookahead"))
     total = len(chunks)
     log("文本共 %d 字，分割为 %d 段（每段 %d 字符）" % (len(text.strip()), total, chunk_size))
     if total == 0:
