@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests playwright pyinstaller
+          pip install "requests[socks]" playwright pyinstaller
           playwright install chromium
 
       - name: Build exe (PyInstaller)

@@ -33,6 +33,7 @@ REF_LIST_URL = API_BASE + "/clone2/getRefAudioList"
 SIGN_KEY = "9BSGc4rO5uSkAEDO1UaHur6fui5B5jJ4"
 
 DEFAULT_CONFIG = {
+    "proxy": "",                 # 留空=自动读系统代理；也可填 "127.0.0.1:7897" 或 "none" 强制直连
     "split_at_punctuation": True,
     "request_interval": 1.0,
     "poll_interval": 2.0,
@@ -92,16 +93,47 @@ def load_auth():
 # ---------- 网络会话 ----------
 
 def _system_proxies():
-    """读 macOS 系统代理；环境变量代理不可靠。"""
+    """解析代理设置。端口不写死，按当前环境自动判断。
+
+    优先级：
+      1) config.json 里的 "proxy"（手动指定；填 none/direct/off 表示强制直连）
+      2) macOS 系统代理：HTTPS -> HTTP -> SOCKS（端口是多少就用多少）
+      3) 都没有 -> 返回 None，直接连
+    """
+    manual = str(load_config().get("proxy") or "").strip()
+    if manual:
+        if manual.lower() in ("none", "direct", "off", "0"):
+            return None
+        if "://" not in manual:
+            manual = "http://" + manual
+        return {"http": manual, "https": manual}
+
     try:
         r = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5)
-        mh = re.search(r"HTTPSProxy\s*:\s*(\S+)", r.stdout)
-        mp = re.search(r"HTTPSPort\s*:\s*(\d+)", r.stdout)
-        if mh and mp:
-            url = "http://%s:%s" % (mh.group(1), mp.group(1))
-            return {"http": url, "https": url}
+        out = r.stdout
     except Exception:
-        pass
+        return None
+
+    def pick(enable_key, host_key, port_key, scheme):
+        en = re.search(enable_key + r"\s*:\s*(\d+)", out)
+        host = re.search(host_key + r"\s*:\s*(\S+)", out)
+        port = re.search(port_key + r"\s*:\s*(\d+)", out)
+        if not (en and host and port) or en.group(1) != "1":
+            return None
+        return "%s://%s:%s" % (scheme, host.group(1), port.group(1))
+
+    url = (pick("HTTPSEnable", "HTTPSProxy", "HTTPSPort", "http")
+           or pick("HTTPEnable", "HTTPProxy", "HTTPPort", "http"))
+    if url:
+        return {"http": url, "https": url}
+
+    socks = pick("SOCKSEnable", "SOCKSProxy", "SOCKSPort", "socks5h")
+    if socks:
+        try:
+            import socks  # noqa: F401  需要 PySocks 才能走 SOCKS
+            return {"http": socks, "https": socks}
+        except Exception:
+            pass
     return None
 
 
