@@ -52,6 +52,26 @@ def _extract_token_from_storage(storage: dict):
     return candidates[0] if candidates else None
 
 
+def _launch_browser(p, headless, log=print):
+    """优先用系统已装浏览器（Windows 的 Edge、mac 的 Chrome），
+    避免打包时把 Chromium 内核塞进安装包；都没有才回退到自带 Chromium。"""
+    channels = ["msedge", "chrome"] if sys.platform.startswith("win") else ["chrome", "msedge"]
+    for ch in channels:
+        try:
+            b = p.chromium.launch(headless=headless, channel=ch)
+            log("已使用系统浏览器：%s" % ch)
+            return b
+        except Exception:
+            continue
+    try:
+        b = p.chromium.launch(headless=headless)
+        log("已使用内置浏览器内核")
+        return b
+    except Exception as e:
+        raise RuntimeError(
+            "找不到可用浏览器。请安装 Microsoft Edge 或 Google Chrome 后重试。（%s）" % e)
+
+
 def login_and_save_token(headless=False, account="", password="", timeout=180, log=print):
     """打开网站让用户登录（或自动填账号密码），成功后把 cookies + localStorage 存到 token.json。
 
@@ -61,7 +81,7 @@ def login_and_save_token(headless=False, account="", password="", timeout=180, l
 
     log("打开浏览器，进入 %s" % LOGIN_PAGE)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = _launch_browser(p, headless, log=log)
         ctx = browser.new_context(viewport={"width": 1280, "height": 860})
         page = ctx.new_page()
         page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=60000)

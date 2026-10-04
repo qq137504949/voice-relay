@@ -8,3 +8,8 @@ build/
 dist/
 *.spec
 .DS_Store
+dist_mac/
+dist_windows/
+build_mac/
+installer_output/
+*.zip
