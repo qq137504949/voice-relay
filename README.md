@@ -28,14 +28,19 @@ playwright install chromium
 
 ## 代理设置
 
-**不需要手动配端口。** 程序启动时按以下顺序自动判断：
+**不需要手动配端口。** 每次开始前按以下顺序自动判断：
 
 1. `config.json` 里的 `proxy` 字段（手动指定时优先）
-2. macOS **系统代理**设置（`HTTPS` → `HTTP` → `SOCKS`，端口是多少就用多少）
-3. 都没有 → 直连
+2. **系统代理**：
+   - Windows —— 读「Internet 选项」的注册表设置（`ProxyEnable` / `ProxyServer`）
+   - macOS —— 读 `scutil --proxy`（`HTTPS` → `HTTP` → `SOCKS`）
+   - 其他 —— 读 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 环境变量
+3. 上面都没有时，**自动探测本机常见代理端口**（7890 / 7897 / 10809 / 1080 / 8888 …），
+   系统代理没开但代理软件在运行也能连上
+4. 都没有 → 直连
 
-所以只要 Clash / Surge 之类的代理把「系统代理」打开，无论端口是 7890、7897 还是别的，
-程序都能自动跟随。换端口不用改代码。
+所以只要代理软件（Clash / Clash Verge / v2rayN / Surge 等）在跑，无论端口是
+7890、7897 还是别的，程序都能自动跟随，**换端口不用改代码**。
 
 需要手动指定时，在 `config.json` 里加：
 
@@ -46,7 +51,7 @@ playwright install chromium
 ```
 
 - 填 `"none"` / `"direct"` / `"off"` → 强制直连（不走代理）
-- 省略或留空 → 自动读系统代理
+- 省略或留空 → 自动探测
 - 支持 `http://`、`socks5h://` 前缀，省略时按 `http://` 处理
 
 生成的音频在 `output/配音_HHMMSS.mp3`（打包版为 `~/.voice-relay/output/`）。

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -92,22 +93,76 @@ def load_auth():
 
 # ---------- 网络会话 ----------
 
-def _system_proxies():
-    """解析代理设置。端口不写死，按当前环境自动判断。
+# 本机常见代理软件的默认端口（Clash / Clash Verge / v2rayN / Surge / Fiddler 等）
+COMMON_PROXY_PORTS = (7890, 7897, 7891, 10809, 10808, 1080, 2080, 8888, 6152, 33210)
+_PROXY_TTL = 30.0  # 自动探测结果缓存时间（秒）
+_proxy_cache = {"ts": 0.0, "value": None}
 
-    优先级：
-      1) config.json 里的 "proxy"（手动指定；填 none/direct/off 表示强制直连）
-      2) macOS 系统代理：HTTPS -> HTTP -> SOCKS（端口是多少就用多少）
-      3) 都没有 -> 返回 None，直接连
-    """
-    manual = str(load_config().get("proxy") or "").strip()
-    if manual:
-        if manual.lower() in ("none", "direct", "off", "0"):
-            return None
-        if "://" not in manual:
-            manual = "http://" + manual
-        return {"http": manual, "https": manual}
 
+def _with_scheme(hostport, scheme="http"):
+    hostport = str(hostport).strip()
+    if "://" in hostport:
+        return hostport
+    return "%s://%s" % (scheme, hostport)
+
+
+def _socks_ok():
+    try:
+        import socks  # noqa: F401  PySocks
+        return True
+    except Exception:
+        return False
+
+
+def _parse_win_registry_proxy():
+    """Windows 系统代理（Internet Settings 注册表）。返回 (http, https) 或 None。"""
+    try:
+        import winreg
+    except Exception:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            def q(name):
+                try:
+                    return winreg.QueryValueEx(k, name)[0]
+                except FileNotFoundError:
+                    return None
+            if str(q("ProxyEnable") or "0") not in ("1", "True"):
+                return None
+            server = str(q("ProxyServer") or "").strip()
+    except Exception:
+        return None
+    if not server:
+        return None
+
+    http_p = https_p = None
+    if "=" in server:
+        # 形如 http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:7892
+        for part in server.split(";"):
+            if "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            key, val = key.strip().lower(), val.strip()
+            if not val:
+                continue
+            if key == "http":
+                http_p = _with_scheme(val)
+            elif key == "https":
+                https_p = _with_scheme(val)
+            elif key == "socks":
+                if _socks_ok():
+                    http_p = https_p = _with_scheme(val, "socks5h")
+    else:
+        http_p = https_p = _with_scheme(server)
+
+    if not http_p and not https_p:
+        return None
+    return (http_p or https_p, https_p or http_p)
+
+
+def _parse_mac_proxy():
+    """macOS 系统代理（scutil --proxy）。返回 (http, https) 或 None。"""
     try:
         r = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5)
         out = r.stdout
@@ -124,26 +179,83 @@ def _system_proxies():
 
     url = (pick("HTTPSEnable", "HTTPSProxy", "HTTPSPort", "http")
            or pick("HTTPEnable", "HTTPProxy", "HTTPPort", "http"))
-    if url:
-        return {"http": url, "https": url}
+    if not url:
+        url = pick("SOCKSEnable", "SOCKSProxy", "SOCKSPort", "socks5h")
+        if url and not _socks_ok():
+            url = None
+    return (url, url) if url else None
 
-    socks = pick("SOCKSEnable", "SOCKSProxy", "SOCKSPort", "socks5h")
-    if socks:
-        try:
-            import socks  # noqa: F401  需要 PySocks 才能走 SOCKS
-            return {"http": socks, "https": socks}
-        except Exception:
-            pass
+
+def _parse_env_proxy():
+    """环境变量里的代理（Windows 上很常见）。"""
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            url = _with_scheme(val)
+            if url.startswith("socks") and not _socks_ok():
+                continue
+            return (url, url)
     return None
 
 
-def get_session():
+def _probe_local_proxy():
+    """系统代理没开启时，探测本机常见代理端口（能连上就认为代理在跑）。"""
+    for port in COMMON_PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                url = "http://127.0.0.1:%d" % port
+                return (url, url)
+        except Exception:
+            continue
+    return None
+
+
+def _system_proxies(force_refresh=False):
+    """解析代理，返回 {"http":..., "https":...}；None 表示直连。
+
+    优先级（端口不写死，按当前环境自动判断）：
+      1) config.json 的 "proxy" 字段（none/direct/off = 强制直连；可省略 scheme）
+      2) 系统代理：Windows 注册表 / macOS scutil / 环境变量
+      3) 本机常见代理端口探测（系统代理没开、但代理软件在运行）
+      4) 都没有 -> 直连
+    """
+    manual = str(load_config().get("proxy") or "").strip()
+    if manual:
+        if manual.lower() in ("none", "direct", "off", "0"):
+            return None
+        url = _with_scheme(manual)
+        return {"http": url, "https": url}
+
+    now = time.time()
+    if not force_refresh and now - _proxy_cache["ts"] < _PROXY_TTL:
+        return _proxy_cache["value"]
+
+    if sys.platform.startswith("win"):
+        found = _parse_win_registry_proxy() or _parse_env_proxy()
+    elif sys.platform == "darwin":
+        found = _parse_mac_proxy() or _parse_env_proxy()
+    else:
+        found = _parse_env_proxy()
+    if not found:
+        found = _probe_local_proxy()
+
+    value = {"http": found[0], "https": found[1]} if found else None
+    _proxy_cache.update(ts=now, value=value)
+    return value
+
+
+def get_session(force_refresh=False):
     s = requests.Session()
     s.trust_env = False
-    px = _system_proxies()
+    px = _system_proxies(force_refresh=force_refresh)
     if px:
         s.proxies.update(px)
     return s
+
+
+def _describe_channel(session):
+    return session.proxies.get("https") or "直连"
 
 
 def _js_hex_key(key_str):
@@ -185,8 +297,25 @@ def _headers(auth, body):
     }
 
 
+def _friendly_net_error(e):
+    """把网络异常翻译成可操作的提示。"""
+    low = str(e).lower()
+    if "proxy" in low or isinstance(e, requests.exceptions.ProxyError):
+        return ("代理连接失败：%s\n"
+                "请在 config.json 里设置正确的代理（例如 {\"proxy\": \"127.0.0.1:7897\"}），"
+                "或填 {\"proxy\": \"none\"} 强制直连。" % e)
+    if isinstance(e, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)) or "timed out" in low:
+        return ("连接超时：%s\n"
+                "通常是本机没走代理导致。请开启代理软件的「系统代理」，"
+                "或在 config.json 里设置 {\"proxy\": \"127.0.0.1:7890\"}。" % e)
+    return "网络异常：%s\n请检查网络连接或代理设置。" % e
+
+
 def _post(session, auth, url, body, log=print):
-    r = session.post(url, headers=_headers(auth, body), json=body, timeout=60)
+    try:
+        r = session.post(url, headers=_headers(auth, body), json=body, timeout=60)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(_friendly_net_error(e))
     if r.status_code in (401, 403):
         raise RuntimeError("登录态失效（HTTP %d），请重新点「登录保存 token」" % r.status_code)
     if r.status_code >= 500:
@@ -212,6 +341,8 @@ def list_references(session=None, auth=None, log=print):
     if not auth:
         raise RuntimeError("未登录，请先点「登录保存 token」")
     s = session or get_session()
+    if session is None:
+        log("网络通道：%s" % _describe_channel(s))
     data = _post(s, auth, REF_LIST_URL, {}, log=log)
     return data.get("refList") or []
 
@@ -314,8 +445,7 @@ def synthesize(text, chunk_size, reference_id, out_path, log=print, should_stop=
         raise RuntimeError("未登录：请先点「登录保存 token」")
 
     session = get_session()
-    px = session.proxies.get("https")
-    log("网络通道：%s" % (px if px else "直连"))
+    log("网络通道：%s" % _describe_channel(session))
     log("账号：%s" % auth.get("email", auth["account"]))
 
     if not reference_id:
@@ -341,8 +471,11 @@ def synthesize(text, chunk_size, reference_id, out_path, log=print, should_stop=
         url = _tts_one(session, auth, chunk, reference_id,
                        float(cfg.get("poll_interval", 2.0)),
                        int(cfg.get("poll_timeout", 180)), log=log)
-        r = session.get(url, timeout=120)
-        r.raise_for_status()
+        try:
+            r = session.get(url, timeout=120)
+            r.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError("下载音频失败：%s" % _friendly_net_error(e))
         audio = r.content
         if len(audio) < 512:
             log("警告：第 %d 段音频只有 %d 字节，可能为空" % (idx, len(audio)))
