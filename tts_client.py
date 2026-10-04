@@ -35,8 +35,9 @@ SIGN_KEY = "9BSGc4rO5uSkAEDO1UaHur6fui5B5jJ4"
 
 DEFAULT_CONFIG = {
     "proxy": "",                 # 留空=自动读系统代理；也可填 "127.0.0.1:7897" 或 "none" 强制直连
-    "split_at_punctuation": True,   # 优先在标点处断句（强烈建议开启，关闭则纯按字符数切）
-    "punct_lookahead": None,        # 为凑标点允许多看几个字；None=自动(1/4，最多8)，0=严格不超
+    "split_at_punctuation": True,   # 只在标点处断句（不建议关闭）
+    "punct_lookahead": None,        # 为凑标点允许多看几个字；None=自动(1/4，最多8)
+    "max_chars_per_request": 200,   # 接口单次文本上限，无标点时超过它才被迫断开
     "request_interval": 1.0,
     "poll_interval": 2.0,
     "poll_timeout": 180,
@@ -362,15 +363,20 @@ _PUNCT_BONUS = {ch: 3 for ch in _SENT_END}
 _PUNCT_BONUS.update({ch: 5 for ch in _PARA_END})
 
 
-def _pick_cut(text, start, chunk_size, min_len, lookahead):
-    """在 start 附近找一个最合适的切点（返回绝对索引，标点归前一段）。
+def _pick_cut(text, start, chunk_size, min_len, lookahead, hard_limit):
+    """找一个切点（绝对索引，标点归前一段）；找不到标点返回 None。
 
-    只在 [start+min_len, start+chunk_size+lookahead] 里挑，避免切出过短碎片；
-    优先段落/句末标点，同类里取离目标长度最近的；没有标点则返回 None。
+    绝不硬切：
+      1) 先在目标位置附近挑最优标点（离目标近 + 标点等级高）
+      2) 附近没有，就继续往后找「第一个标点」，宁可这一段长一点
+      3) 直到 hard_limit（接口单次上限）为止都没有标点 -> None（整段不切）
     """
     target = start + chunk_size
+    n = len(text)
+
+    # 第一轮：目标附近，按「离目标近 + 标点等级高」挑最优（不得越过接口上限）
     lo = start + min_len
-    hi = min(start + chunk_size + lookahead, len(text))
+    hi = min(start + chunk_size + lookahead, start + hard_limit, n)
     best, best_score = None, None
     for k in range(lo, hi):
         ch = text[k]
@@ -380,16 +386,27 @@ def _pick_cut(text, start, chunk_size, min_len, lookahead):
         score = abs(cut - target) - _PUNCT_BONUS.get(ch, 0)
         if best_score is None or score < best_score:
             best, best_score = cut, score
-    return best
+    if best is not None:
+        return best
+
+    # 第二轮：往后找第一个标点（允许超过 chunk_size，但不越过接口上限）
+    for k in range(hi, min(start + hard_limit, n)):
+        if text[k] in _PUNCT:
+            return k + 1
+    return None
 
 
-def split_text(text, chunk_size=20, prefer_punct=True, lookahead=None):
-    """按字符数分段，但优先在标点处裁开，避免把句子/词切断。
+def split_text(text, chunk_size=20, prefer_punct=True, lookahead=None,
+               max_chars=200, log=None):
+    """按字符数分段，只在标点处裁开，绝不硬切。
 
-    - 每段尽量不超过 chunk_size；为了凑到标点允许向后多看 lookahead 个字
     - 优先段落换行，其次句末标点（。！？；），再次句内停顿（，、：）
+    - 目标长度是 chunk_size，为凑到标点允许一定浮动
+    - 附近没标点就往后找第一个标点；到 max_chars（接口单次上限）都没有，
+      就整段留着不切
     - 标点跟着前一段，下一段从标点之后开始
-    - 窗口中确实没有标点时，才退回按字符数硬切
+
+    返回分段字符串列表。
     """
     text = text.strip()
     if not text:
@@ -405,6 +422,7 @@ def split_text(text, chunk_size=20, prefer_punct=True, lookahead=None):
     if lookahead is None:
         lookahead = max(1, min(chunk_size // 4, 8))   # 默认允许略微超出以凑标点
     lookahead = max(0, int(lookahead))
+    hard_limit = max(chunk_size, int(max_chars))      # 单次请求的字符上限
 
     chunks = []
     i = 0
@@ -412,7 +430,17 @@ def split_text(text, chunk_size=20, prefer_punct=True, lookahead=None):
         if n - i <= chunk_size:                       # 剩下的不超一段，直接收尾
             chunks.append(text[i:])
             break
-        cut = _pick_cut(text, i, chunk_size, min_len, lookahead) or (i + chunk_size)
+
+        cut = _pick_cut(text, i, chunk_size, min_len, lookahead, hard_limit)
+        if cut is None:
+            # 到接口上限都没有标点：能整段留着就不切，否则只能在上限处断开
+            if n - i <= hard_limit:
+                chunks.append(text[i:])
+                break
+            cut = i + hard_limit
+            if log:
+                log("提示：第 %d 段起连续 %d 字没有标点，为不超过接口 %d 字上限在此断开"
+                    % (len(chunks) + 1, hard_limit, hard_limit))
         chunks.append(text[i:cut])
         i = cut
     return [c.strip() for c in chunks if c.strip()]
@@ -500,8 +528,11 @@ def synthesize(text, chunk_size, reference_id, out_path, log=print, should_stop=
         reference_id = refs[0]["referenceId"]
         log("使用音色：%s（%s）" % (refs[0].get("referenceName"), reference_id))
 
+    max_chars = int(cfg.get("max_chars_per_request", 200))
+    if chunk_size > max_chars:
+        log("注意：分割字数 %d 超过接口单次上限 %d，建议调小" % (chunk_size, max_chars))
     chunks = split_text(text, chunk_size, cfg.get("split_at_punctuation", True),
-                        cfg.get("punct_lookahead"))
+                        cfg.get("punct_lookahead"), max_chars=max_chars, log=log)
     total = len(chunks)
     log("文本共 %d 字，分割为 %d 段（每段 %d 字符）" % (len(text.strip()), total, chunk_size))
     if total == 0:
