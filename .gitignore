@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+token.json
+captured_request.json
+config.json
+output/
+build/
+dist/
+*.spec
+.DS_Store
