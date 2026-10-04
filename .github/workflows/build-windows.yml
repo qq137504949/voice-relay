@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # 把 Chromium 内核打进程序包，最终用户无需装任何东西
+      PLAYWRIGHT_BROWSERS_PATH: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -15,10 +18,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 用系统自带的 Edge 做登录（Windows 10/11 必有），不打包 Chromium，安装包小一大截
       - name: Install dependencies
         run: |
           pip install requests playwright pyinstaller
+          playwright install chromium
 
       - name: Build exe (PyInstaller)
         run: pyinstaller --noconfirm --windowed --name VoiceRelay --collect-all playwright app.py

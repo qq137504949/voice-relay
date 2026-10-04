@@ -53,23 +53,22 @@ def _extract_token_from_storage(storage: dict):
 
 
 def _launch_browser(p, headless, log=print):
-    """优先用系统已装浏览器（Windows 的 Edge、mac 的 Chrome），
-    避免打包时把 Chromium 内核塞进安装包；都没有才回退到自带 Chromium。"""
-    channels = ["msedge", "chrome"] if sys.platform.startswith("win") else ["chrome", "msedge"]
-    for ch in channels:
-        try:
-            b = p.chromium.launch(headless=headless, channel=ch)
-            log("已使用系统浏览器：%s" % ch)
-            return b
-        except Exception:
-            continue
+    """优先用打包进程序里的 Chromium（版本固定、开箱即用）；
+    万一内核缺失，再退回系统已装的 Edge / Chrome。"""
     try:
         b = p.chromium.launch(headless=headless)
         log("已使用内置浏览器内核")
         return b
-    except Exception as e:
-        raise RuntimeError(
-            "找不到可用浏览器。请安装 Microsoft Edge 或 Google Chrome 后重试。（%s）" % e)
+    except Exception:
+        pass
+    for ch in (["msedge", "chrome"] if sys.platform.startswith("win") else ["chrome", "msedge"]):
+        try:
+            b = p.chromium.launch(headless=headless, channel=ch)
+            log("内置内核不可用，已改用系统浏览器：%s" % ch)
+            return b
+        except Exception:
+            continue
+    raise RuntimeError("找不到可用浏览器：内置内核异常，系统也没装 Edge/Chrome。")
 
 
 def login_and_save_token(headless=False, account="", password="", timeout=180, log=print):
