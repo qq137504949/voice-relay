@@ -73,7 +73,7 @@ def download(url, out_path, threads=16, token=None):
     def worker(idx, start, end):
         p = os.path.join(tmpdir, "%03d" % idx)
         got = os.path.getsize(p) if os.path.exists(p) else 0
-        for attempt in range(5):
+        for attempt in range(12):
             try:
                 s = start + got
                 if got and s > end:
@@ -89,22 +89,26 @@ def download(url, out_path, threads=16, token=None):
                             if not chunk:
                                 continue
                             f.write(chunk)
-                            with lock:
-                                done[idx] += len(chunk)
-                            got += len(chunk)
+                got = os.path.getsize(p)
                 if got >= end - start + 1:
                     return
             except Exception as e:  # 断流就续传重试
                 errors.append(str(e))
-                time.sleep(2)
+                got = os.path.getsize(p) if os.path.exists(p) else 0
+                time.sleep(min(2 * (attempt + 1), 10))
         if got < end - start + 1:
-            errors.append("分段 %d 未完成" % idx)
+            errors.append("分段 %d 未完成（%d/%d 字节）" % (idx, got, end - start + 1))
 
     def reporter():
         while any(t.is_alive() for t in ts):
-            cur = sum(done)
+            cur = 0
+            for i, _, _ in ranges:
+                try:
+                    cur += os.path.getsize(os.path.join(tmpdir, "%03d" % i))
+                except OSError:
+                    pass
             pct = cur * 100.0 / total
-            speed = sum(done) / max(1e-6, time.time() - t0)
+            speed = cur / max(1e-6, time.time() - t0)
             sys.stdout.write("\r  %5.1f%%  %6.2f MB / %.2f MB  %.0f KB/s   " %
                              (pct, cur / 1e6, total / 1e6, speed / 1024))
             sys.stdout.flush()
@@ -123,6 +127,17 @@ def download(url, out_path, threads=16, token=None):
     if errors:
         print("  警告：%d 次分段重试（%s）" % (len(errors), errors[0]))
 
+    # 拼接前先严格校验每个分段，避免拼出个残文件
+    short = []
+    for i, start, end in ranges:
+        p = os.path.join(tmpdir, "%03d" % i)
+        want = end - start + 1
+        have = os.path.getsize(p) if os.path.exists(p) else 0
+        if have != want:
+            short.append("分段 %d: %d/%d" % (i, have, want))
+    if short:
+        sys.exit("下载不完整，已中止（%s）。重跑本命令会自动续传。" % "; ".join(short[:5]))
+
     # 拼接
     with open(out_path, "wb") as out:
         for i, _, _ in ranges:
@@ -134,6 +149,8 @@ def download(url, out_path, threads=16, token=None):
                         break
                     out.write(buf)
     size = os.path.getsize(out_path)
+    if size != total:
+        sys.exit("拼接后大小不符：%d != %d" % (size, total))
     print("  完成：%s（%.1f MB，耗时 %.0f 秒）" % (out_path, size / 1e6, time.time() - t0))
     return size
 
