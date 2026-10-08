@@ -32,6 +32,29 @@ playwright install chromium
   本机有 ffmpeg 时会作为兜底。
 - **mp3**：沿用原来的合并方式（有 ffmpeg 用 ffmpeg 拼接，没有则字节直接拼接）。
 
+### wav 解码依赖（出问题时看这里）
+
+wav 需要一个 MP3 解码器，程序按这个顺序找：
+
+1. `miniaudio`（推荐，纯 wheel 274KB，打包版已内置）
+2. 系统 `ffmpeg`（兜底，可选）
+
+**源码运行**如果报「两者都不可用」，程序会**自动执行 `pip install miniaudio`**（会走探测到的系统代理），
+装完继续，不用手动处理。想看当前状态就点界面上的 **「环境自检」** 按钮，会打印：
+
+```
+运行方式：源码运行 / 打包版（frozen）
+_cffi_backend：可用 / 缺失
+_miniaudio：可用 / 不可用
+miniaudio：可用（v1.71）/ 不可用
+ffmpeg：/usr/bin/ffmpeg / 未找到（可选）
+```
+
+**打包版**如果这里显示 `_cffi_backend` 缺失，那是 PyInstaller 的收集问题，不是环境问题：
+`miniaudio` 是单文件模块，真正干活的是 cffi 生成的 `_miniaudio`，而它在 C 层依赖 `_cffi_backend`——
+这个依赖 PyInstaller 的依赖分析看不见。`VoiceRelay.spec` 里已经显式声明
+`hiddenimports += ['miniaudio', '_miniaudio', '_cffi_backend']`，CI 构建也会校验文件是否真的进了包。
+
 
 **只在标点处裁开，绝不硬切**（不会出现把句子、词语从中间劈开的情况）：
 
@@ -53,6 +76,7 @@ playwright install chromium
 | `output_format` | 输出格式，默认 `wav`，可改 `mp3`（GUI 的「格式」下拉框会覆盖并回写这里） |
 | `wav_sample_rate` | wav 采样率，默认 `24000`（源音频即 24k） |
 | `wav_channels` | wav 声道数，默认 `1`（单声道），可改 `2` |
+| `auto_install_miniaudio` | 默认 `true`。源码运行时若缺 miniaudio 自动 `pip install`（打包版忽略此项） |
 
 ## 代理设置
 

@@ -34,6 +34,7 @@ class App:
         self._build_ui()
         self.root.after(100, self._drain_log)
         self._log("就绪。音色下拉框可切换（点「刷新音色」加载）；token 失效时重新点「登录保存 token」。")
+        self.root.after(400, self.do_env_check)
         self.root.after(500, self.do_load_voices)
 
     # ---------- UI ----------
@@ -72,6 +73,7 @@ class App:
         self.start_btn.pack(side="left")
         ttk.Button(row3, text="停止", command=self.do_stop).pack(side="left", padx=6)
         ttk.Button(row3, text="打开生成目录", command=self.do_open_output).pack(side="left", padx=6)
+        ttk.Button(row3, text="环境自检", command=self.do_env_check).pack(side="left", padx=6)
         self.progress = ttk.Label(row3, text="")
         self.progress.pack(side="left", padx=10)
 
@@ -191,7 +193,21 @@ class App:
 
     def do_open_output(self):
         os.makedirs(DEFAULT_OUT, exist_ok=True)
-        subprocess.Popen(["open", DEFAULT_OUT])
+        if sys.platform.startswith("win"):
+            os.startfile(DEFAULT_OUT)  # noqa: S606 - Windows 资源管理器
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", DEFAULT_OUT])
+        else:
+            subprocess.Popen(["xdg-open", DEFAULT_OUT])
+
+    def do_env_check(self):
+        """打印音频环境自检：miniaudio / _cffi_backend / ffmpeg 是否就绪。"""
+        def job():
+            self._log("----- 环境自检 -----")
+            for line in tts_client.audio_env_report().splitlines():
+                self._log(line)
+            self._log("--------------------")
+        threading.Thread(target=job, daemon=True).start()
 
 
 if __name__ == "__main__":

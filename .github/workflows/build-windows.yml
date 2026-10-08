@@ -24,12 +24,17 @@ jobs:
           playwright install chromium
 
       - name: Build exe (PyInstaller)
-        run: >
-          pyinstaller --noconfirm --windowed --name VoiceRelay
-          --collect-all playwright
-          --collect-all miniaudio
-          --hidden-import _cffi_backend
-          app.py
+        # 与 macOS 共用 VoiceRelay.spec，避免两边参数漂移（上次就是 CI 少了
+        # _cffi_backend 才导致 Windows 出不了 wav）
+        run: pyinstaller --noconfirm --distpath dist --workpath build VoiceRelay.spec
+
+      - name: Verify miniaudio shipped
+        shell: cmd
+        run: |
+          dir /b dist\VoiceRelay\_internal | findstr /i "cffi miniaudio"
+          if not exist "dist\VoiceRelay\_internal\_cffi_backend.cp312-win_amd64.pyd" exit /b 1
+          if not exist "dist\VoiceRelay\_internal\_miniaudio.pyd" exit /b 1
+          echo OK: miniaudio + _cffi_backend bundled
 
       - name: Prepare Inno Setup Chinese language file
         shell: cmd

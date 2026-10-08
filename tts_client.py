@@ -6,6 +6,7 @@
 import base64
 import hashlib
 import hmac
+import importlib
 import json
 import os
 import re
@@ -15,11 +16,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.parse
 
 import requests
 
-if getattr(sys, "frozen", False):  # PyInstaller 打包后，数据放用户主目录
+FROZEN = bool(getattr(sys, "frozen", False))
+
+if FROZEN:  # PyInstaller 打包后，数据放用户主目录
     BASE_DIR = os.path.join(os.path.expanduser("~"), ".voice-relay")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +42,7 @@ DEFAULT_CONFIG = {
     "output_format": "wav",      # 输出格式：wav（PCM 无损）/ mp3
     "wav_sample_rate": 24000,    # wav 采样率（源音频即 24k）
     "wav_channels": 1,           # wav 声道数：1=单声道，2=立体声
+    "auto_install_miniaudio": True,  # 源码运行时若缺 miniaudio，自动 pip 装一次
     "split_at_punctuation": True,   # 只在标点处断句（不建议关闭）
     "punct_lookahead": None,        # 为凑标点允许多看几个字；None=自动(1/4，最多8)
     "max_chars_per_request": 200,   # 接口单次文本上限，无标点时超过它才被迫断开
@@ -474,6 +479,137 @@ def _tts_one(session, auth, text, reference_id, poll_interval, poll_timeout, log
     raise RuntimeError("轮询超时（%ds），taskSn=%s" % (poll_timeout, task_sn))
 
 
+# ---------- wav 解码依赖（miniaudio / ffmpeg） ----------
+
+_MINIAUDIO_STATE = {"module": None, "error": None, "installed": False}
+
+
+def _pip_proxy_args():
+    """把探测到的系统代理转成 pip 的 --proxy 参数（只在 http/https 代理时给）。"""
+    try:
+        px = _system_proxies()
+    except Exception:
+        return []
+    url = (px or {}).get("https") or (px or {}).get("http")
+    if not url or not url.startswith(("http://", "https://")):
+        return []
+    return ["--proxy", url]
+
+
+def _pip_install_miniaudio(log=print):
+    """源码运行时自动补装 miniaudio（它只有 274KB，纯 wheel，无需编译）。"""
+    cmds = [
+        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+         "miniaudio"] + _pip_proxy_args(),
+        [sys.executable, "-m", "pip", "install", "--user", "--disable-pip-version-check",
+         "miniaudio"] + _pip_proxy_args(),
+    ]
+    log("缺少 miniaudio，正在自动安装（pip install miniaudio）…")
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except Exception as e:
+            log("  自动安装失败：%s: %s" % (type(e).__name__, e))
+            continue
+        if r.returncode == 0:
+            log("  miniaudio 安装成功")
+            for name in ("miniaudio", "_miniaudio"):
+                sys.modules.pop(name, None)
+            try:
+                importlib.invalidate_caches()
+            except Exception:
+                pass
+            return True
+        tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        log("  pip 退出码 %d：%s" % (r.returncode, tail[-1] if tail else "(无输出)"))
+    log("  自动安装未成功，可手动执行：%s -m pip install miniaudio" % sys.executable)
+    return False
+
+
+def import_miniaudio(log=print, auto_install=None):
+    """导入 miniaudio（纯 pip 依赖，内置 MP3 解码器，打包后不需要 ffmpeg）。
+
+    源码运行且缺失时自动装一次；打包版缺失说明 PyInstaller 没把
+    _cffi_backend 带上，这种情况自动装也没用，直接报清楚原因。
+    """
+    if _MINIAUDIO_STATE["module"] is not None:
+        return _MINIAUDIO_STATE["module"]
+    if auto_install is None:
+        auto_install = bool(load_config().get("auto_install_miniaudio", True))
+
+    try:
+        import miniaudio
+        _MINIAUDIO_STATE["module"] = miniaudio
+        _MINIAUDIO_STATE["error"] = None
+        return miniaudio
+    except Exception as e:
+        first = e
+        log("miniaudio 导入失败：%s: %s" % (type(e).__name__, e))
+
+    if not FROZEN and auto_install and not _MINIAUDIO_STATE["installed"]:
+        if _pip_install_miniaudio(log=log):
+            _MINIAUDIO_STATE["installed"] = True
+            try:
+                sys.modules.pop("miniaudio", None)
+                import miniaudio
+                _MINIAUDIO_STATE["module"] = miniaudio
+                _MINIAUDIO_STATE["error"] = None
+                return miniaudio
+            except Exception as e:
+                first = e
+                log("自动安装后仍无法导入：%s: %s" % (type(e).__name__, e))
+
+    _MINIAUDIO_STATE["error"] = first
+    return None
+
+
+def ffi_backend_ok():
+    """打包版自查用：_cffi_backend 是否在包内（miniaudio 的 C 层依赖）。"""
+    try:
+        import _cffi_backend  # noqa: F401
+        return True, getattr(_cffi_backend, "__file__", "?")
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def audio_env_report():
+    """音频环境自检，返回可直接打日志的多行文本。"""
+    lines = ["运行方式：%s" % ("打包版（frozen）" if FROZEN else "源码运行"),
+             "Python：%s (%s)" % (sys.version.split()[0], sys.executable)]
+    ok, info = ffi_backend_ok()
+    lines.append("_cffi_backend：%s" % ("可用 → %s" % info if ok else "缺失 → %s" % info))
+    try:
+        from _miniaudio import ffi, lib  # noqa: F401
+        lines.append("_miniaudio：可用")
+    except Exception as e:
+        lines.append("_miniaudio：不可用 → %s: %s" % (type(e).__name__, e))
+    try:
+        import miniaudio
+        lines.append("miniaudio：可用（v%s）" % getattr(miniaudio, "__version__", "?"))
+    except Exception as e:
+        lines.append("miniaudio：不可用 → %s: %s" % (type(e).__name__, e))
+        if FROZEN:
+            lines.append("  打包版异常：应内含 _cffi_backend，缺失即 PyInstaller 收集不全")
+        else:
+            lines.append("  源码运行没装：%s -m pip install miniaudio（生成 wav 时会自动装）"
+                         % sys.executable)
+    ff = shutil.which("ffmpeg")
+    lines.append("ffmpeg：%s" % (ff if ff else "未找到（可选，兜底用）"))
+    return "\n".join(lines)
+
+
+def merge_audio_deps_ready():
+    """wav 输出是否具备解码能力（miniaudio 或 ffmpeg），用于界面提示。"""
+    if _MINIAUDIO_STATE["module"] is not None:
+        return True
+    try:
+        import miniaudio  # noqa: F401
+        return True
+    except Exception:
+        pass
+    return bool(shutil.which("ffmpeg"))
+
+
 # ---------- 音频合并（mp3 分段 → 单个 mp3 / wav） ----------
 
 def _dump_parts(parts, tmpdir, ext=".mp3"):
@@ -535,12 +671,7 @@ def merge_wav(parts, out_path, log=print):
     try:
         paths = _dump_parts(parts, tmpdir)
 
-        try:
-            import miniaudio
-        except Exception as _e:
-            # 注意：打包版必须显式带上 _cffi_backend，否则这里会 ModuleNotFoundError
-            miniaudio = None
-            log("miniaudio 不可用（%s: %s），尝试 ffmpeg" % (type(_e).__name__, _e))
+        miniaudio = import_miniaudio(log=log)
 
         if miniaudio is not None:
             try:
@@ -571,9 +702,8 @@ def merge_wav(parts, out_path, log=print):
                 return out_path
             raise RuntimeError("ffmpeg 生成 wav 失败：%s" % (r.stderr or "")[-500:])
 
-        raise RuntimeError("生成 wav 需要 miniaudio 或 ffmpeg，两者都不可用。"
-                           "源码运行请 pip install miniaudio；"
-                           "打包版请检查 PyInstaller 是否带了 _cffi_backend")
+        raise RuntimeError("生成 wav 需要 miniaudio 或 ffmpeg，两者都不可用。\n"
+                           "----- 环境自检 -----\n" + audio_env_report())
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
