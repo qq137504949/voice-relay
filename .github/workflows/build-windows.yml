@@ -24,7 +24,12 @@ jobs:
           playwright install chromium
 
       - name: Build exe (PyInstaller)
-        run: pyinstaller --noconfirm --windowed --name VoiceRelay --collect-all playwright --collect-all miniaudio app.py
+        run: >
+          pyinstaller --noconfirm --windowed --name VoiceRelay
+          --collect-all playwright
+          --collect-all miniaudio
+          --hidden-import _cffi_backend
+          app.py
 
       - name: Prepare Inno Setup Chinese language file
         shell: cmd

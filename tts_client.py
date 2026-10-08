@@ -537,8 +537,10 @@ def merge_wav(parts, out_path, log=print):
 
         try:
             import miniaudio
-        except ImportError:
+        except Exception as _e:
+            # 注意：打包版必须显式带上 _cffi_backend，否则这里会 ModuleNotFoundError
             miniaudio = None
+            log("miniaudio 不可用（%s: %s），尝试 ffmpeg" % (type(_e).__name__, _e))
 
         if miniaudio is not None:
             try:
@@ -569,8 +571,9 @@ def merge_wav(parts, out_path, log=print):
                 return out_path
             raise RuntimeError("ffmpeg 生成 wav 失败：%s" % (r.stderr or "")[-500:])
 
-        raise RuntimeError("生成 wav 需要 miniaudio 或 ffmpeg，两者都不可用"
-                           "（pip install miniaudio 即可）")
+        raise RuntimeError("生成 wav 需要 miniaudio 或 ffmpeg，两者都不可用。"
+                           "源码运行请 pip install miniaudio；"
+                           "打包版请检查 PyInstaller 是否带了 _cffi_backend")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
