@@ -1,6 +1,6 @@
 # 配音中转站（nicevoice）
 
-长文本 → 按字符数分割 → 多次调用 nicevoice 配音接口 → 合并为一个 mp3。
+长文本 → 按字符数分割 → 多次调用 nicevoice 配音接口 → 合并为一个音频文件（**wav** / mp3）。
 
 ## 安装
 
@@ -23,7 +23,15 @@ playwright install chromium
 
 直接粘贴文本 → 开始生成。token 过期时日志会提示，重新点一次「登录」即可。
 
-顶部「分割字符数」默认 20：超过该长度的文本会被切成多段分别合成，最后合并成一个 mp3。
+顶部「分割字符数」默认 20：超过该长度的文本会被切成多段分别合成，最后合并成一个音频文件。
+右上角「格式」可选 **wav（默认）** 或 mp3，选择会被记到 `config.json`。
+
+- **wav**：无损 PCM 输出（24000 Hz / 单声道 / 16bit，与原音频一致）。
+  接口返回的每段 mp3 会先解码成 PCM，再拼成一个 wav。
+  解码用 `miniaudio`（纯 pip 依赖，内置 MP3 解码器），**打包版无需另外安装 ffmpeg**；
+  本机有 ffmpeg 时会作为兜底。
+- **mp3**：沿用原来的合并方式（有 ffmpeg 用 ffmpeg 拼接，没有则字节直接拼接）。
+
 
 **只在标点处裁开，绝不硬切**（不会出现把句子、词语从中间劈开的情况）：
 
@@ -42,6 +50,9 @@ playwright install chromium
 | `split_at_punctuation` | 默认 `true`。设为 `false` 则退回纯按字符数切 |
 | `punct_lookahead` | 在目标长度附近找标点时的浮动余量。默认自动；填 `0` 表示只在目标长度之前找 |
 | `max_chars_per_request` | 接口单次文本上限，默认 `200`；只有到它仍无标点才会被迫断开 |
+| `output_format` | 输出格式，默认 `wav`，可改 `mp3`（GUI 的「格式」下拉框会覆盖并回写这里） |
+| `wav_sample_rate` | wav 采样率，默认 `24000`（源音频即 24k） |
+| `wav_channels` | wav 声道数，默认 `1`（单声道），可改 `2` |
 
 ## 代理设置
 
@@ -71,5 +82,5 @@ playwright install chromium
 - 省略或留空 → 自动探测
 - 支持 `http://`、`socks5h://` 前缀，省略时按 `http://` 处理
 
-生成的音频在 `output/配音_HHMMSS.mp3`（打包版为 `~/.voice-relay/output/`）。
+生成的音频在 `output/配音_HHMMSS.wav`（打包版为 `~/.voice-relay/output/`）。
 登录态、配置等数据在源码运行时位于项目目录，打包版统一放在 `~/.voice-relay/`。

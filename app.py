@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""配音中转站 GUI：长文本 → 分段调用 nicevoice 接口 → 合并成一个 mp3"""
+"""配音中转站 GUI：长文本 → 分段调用 nicevoice 接口 → 合并成一个音频文件（wav / mp3）"""
 import json
 import os
 import queue
@@ -51,6 +51,10 @@ class App:
         self.voice_combo.pack(side="left", padx=(2, 4))
         self.voice_map = {}  # 显示名 -> referenceId
         ttk.Button(row1, text="刷新音色", command=self.do_load_voices).pack(side="left", padx=2)
+        ttk.Label(row1, text="格式:").pack(side="left", padx=(10, 0))
+        self.fmt_var = tk.StringVar(value=str(tts_client.load_config().get("output_format", "wav")).lower())
+        ttk.Combobox(row1, state="readonly", width=5, textvariable=self.fmt_var,
+                     values=("wav", "mp3")).pack(side="left", padx=2)
 
         row2 = ttk.Frame(frm)
         row2.pack(fill="x", pady=4)
@@ -152,7 +156,14 @@ class App:
             return
 
         os.makedirs(DEFAULT_OUT, exist_ok=True)
-        out_path = os.path.join(DEFAULT_OUT, "配音_%s.mp3" % time.strftime("%H%M%S"))
+        fmt = (self.fmt_var.get() or "wav").lower().lstrip(".")
+        out_path = os.path.join(DEFAULT_OUT, "配音_%s.%s" % (time.strftime("%H%M%S"), fmt))
+        try:  # 记住格式选择
+            cfg = tts_client.load_config()
+            cfg["output_format"] = fmt
+            tts_client.save_config(cfg)
+        except Exception:
+            pass
 
         self.stop_flag.clear()
         self.start_btn.configure(state="disabled")

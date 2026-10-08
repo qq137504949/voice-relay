@@ -20,11 +20,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install "requests[socks]" playwright pyinstaller
+          pip install "requests[socks]" playwright miniaudio pyinstaller
           playwright install chromium
 
       - name: Build exe (PyInstaller)
-        run: pyinstaller --noconfirm --windowed --name VoiceRelay --collect-all playwright app.py
+        run: pyinstaller --noconfirm --windowed --name VoiceRelay --collect-all playwright --collect-all miniaudio app.py
 
       - name: Prepare Inno Setup Chinese language file
         shell: cmd

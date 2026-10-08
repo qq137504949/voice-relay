@@ -35,6 +35,9 @@ SIGN_KEY = "9BSGc4rO5uSkAEDO1UaHur6fui5B5jJ4"
 
 DEFAULT_CONFIG = {
     "proxy": "",                 # 留空=自动读系统代理；也可填 "127.0.0.1:7897" 或 "none" 强制直连
+    "output_format": "wav",      # 输出格式：wav（PCM 无损）/ mp3
+    "wav_sample_rate": 24000,    # wav 采样率（源音频即 24k）
+    "wav_channels": 1,           # wav 声道数：1=单声道，2=立体声
     "split_at_punctuation": True,   # 只在标点处断句（不建议关闭）
     "punct_lookahead": None,        # 为凑标点允许多看几个字；None=自动(1/4，最多8)
     "max_chars_per_request": 200,   # 接口单次文本上限，无标点时超过它才被迫断开
@@ -471,26 +474,34 @@ def _tts_one(session, auth, text, reference_id, poll_interval, poll_timeout, log
     raise RuntimeError("轮询超时（%ds），taskSn=%s" % (poll_timeout, task_sn))
 
 
-# ---------- MP3 合并 ----------
+# ---------- 音频合并（mp3 分段 → 单个 mp3 / wav） ----------
+
+def _dump_parts(parts, tmpdir, ext=".mp3"):
+    paths = []
+    for idx, data in enumerate(parts):
+        p = os.path.join(tmpdir, "part_%03d%s" % (idx, ext))
+        with open(p, "wb") as f:
+            f.write(data)
+        paths.append(p)
+    return paths
+
+
+def _concat_list(paths, tmpdir):
+    list_file = os.path.join(tmpdir, "list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for p in paths:
+            f.write("file '%s'\n" % p.replace("'", "'\\''"))
+    return list_file
+
 
 def merge_mp3(parts, out_path, log=print):
     tmpdir = tempfile.mkdtemp(prefix="voice_relay_")
     try:
-        paths = []
-        for idx, data in enumerate(parts):
-            p = os.path.join(tmpdir, "part_%03d.mp3" % idx)
-            with open(p, "wb") as f:
-                f.write(data)
-            paths.append(p)
-
+        paths = _dump_parts(parts, tmpdir)
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
-            list_file = os.path.join(tmpdir, "list.txt")
-            with open(list_file, "w", encoding="utf-8") as f:
-                for p in paths:
-                    f.write("file '%s'\n" % p.replace("'", "'\\''"))
             r = subprocess.run(
-                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", _concat_list(paths, tmpdir),
                  "-c:a", "libmp3lame", "-q:a", "2", out_path],
                 capture_output=True, text=True)
             if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -506,6 +517,70 @@ def merge_mp3(parts, out_path, log=print):
         return out_path
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def merge_wav(parts, out_path, log=print):
+    """把若干 mp3 分段解码成 PCM，拼接后写成单个 wav。
+
+    优先用 miniaudio（纯 pip 依赖，内置 MP3 解码器，打包后无需 ffmpeg）；
+    没有 miniaudio 时退回系统 ffmpeg。两者都没有则报错。
+    """
+    import wave
+
+    cfg = load_config()
+    rate = int(cfg.get("wav_sample_rate", 24000))
+    ch = int(cfg.get("wav_channels", 1))
+
+    tmpdir = tempfile.mkdtemp(prefix="voice_relay_")
+    try:
+        paths = _dump_parts(parts, tmpdir)
+
+        try:
+            import miniaudio
+        except ImportError:
+            miniaudio = None
+
+        if miniaudio is not None:
+            try:
+                blob = bytearray()
+                for idx, p in enumerate(paths, 1):
+                    d = miniaudio.decode_file(p, output_format=miniaudio.SampleFormat.SIGNED16,
+                                              nchannels=ch, sample_rate=rate)
+                    blob += d.samples.tobytes()
+                    log("  [%d/%d] 解码 %d 帧" % (idx, len(paths), len(d.samples) // max(1, ch)))
+                with wave.open(out_path, "wb") as w:
+                    w.setnchannels(ch)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(bytes(blob))
+                log("wav 合并完成（miniaudio 解码：%d Hz / %d 声道 / 16bit）" % (rate, ch))
+                return out_path
+            except Exception as e:
+                log("miniaudio 解码失败：%s，改用 ffmpeg" % e)
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", _concat_list(paths, tmpdir),
+                 "-ac", str(ch), "-ar", str(rate), "-c:a", "pcm_s16le", out_path],
+                capture_output=True, text=True)
+            if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                log("wav 合并完成（ffmpeg 解码）")
+                return out_path
+            raise RuntimeError("ffmpeg 生成 wav 失败：%s" % (r.stderr or "")[-500:])
+
+        raise RuntimeError("生成 wav 需要 miniaudio 或 ffmpeg，两者都不可用"
+                           "（pip install miniaudio 即可）")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def merge_audio(parts, out_path, log=print):
+    """按输出文件扩展名选择合并方式。"""
+    ext = os.path.splitext(out_path)[1].lower()
+    if ext == ".wav":
+        return merge_wav(parts, out_path, log=log)
+    return merge_mp3(parts, out_path, log=log)
 
 
 # ---------- 主流程 ----------
@@ -561,6 +636,6 @@ def synthesize(text, chunk_size, reference_id, out_path, log=print, should_stop=
         if idx < total and cfg.get("request_interval"):
             time.sleep(float(cfg["request_interval"]))
 
-    merge_mp3(parts, out_path, log=log)
+    merge_audio(parts, out_path, log=log)
     log("已保存：%s" % out_path)
     return out_path
